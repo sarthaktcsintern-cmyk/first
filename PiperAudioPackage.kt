@@ -48,8 +48,7 @@ class PiperAudioPackage(private val context: Context) {
 
     fun stopCurrent() {
         piper.stopCurrent()
-            mainHandler.post { onError?.invoke("STOPPED") }
-        }
+        mainHandler.post { onError?.invoke("STOPPED") }
     }
 
     fun isReady(): Boolean = piper.isReady()
