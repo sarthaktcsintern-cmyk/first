@@ -1,10 +1,12 @@
-package com.example.ecganalysis.audio.piper
+package com.example.audiodemoapp
 
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.BatteryManager
+import android.os.Debug
 import android.util.Log
 import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
@@ -15,8 +17,13 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
-import java.util.concurrent.Executors
-import java.util.concurrent.Future
+data class EnergyMetrics(
+    val cpuTimeMs: Long,          // CPU time used
+    val memoryMB: Double,          // Memory used in MB
+    val estimatedBatteryPercent: Double,  // Estimated battery drain percentage
+    val firstLatencyMs: Long,      // First sample latency
+    val totalLatencyMs: Long       // Total synthesis latency
+)
 
 class PiperTTSManager(private val context: Context) {
     private var tts: OfflineTts? = null
@@ -24,41 +31,32 @@ class PiperTTSManager(private val context: Context) {
     private var audioTrack: AudioTrack? = null
     private var isStopped = false
 
-    // New: latency callback
+    // New: energy and latency callback
     var latencyCallback: ((firstMs: Long, totalMs: Long) -> Unit)? = null
-
-    // New: first-sample callback to notify when audio actually starts
-    var firstSampleCallback: ((requestId: String?) -> Unit)? = null
+    var energyCallback: ((metrics: EnergyMetrics) -> Unit)? = null
 
     // Helpers for measuring first-sample time
     private val firstSampleRecorded = AtomicBoolean(false)
     @Volatile
     private var firstSampleTimeNs: Long = -1L
 
+    // Energy tracking
+    @Volatile
+    private var startCpuTimeMs: Long = 0L
+    @Volatile
+    private var initialMemoryMB: Double = 0.0
+    @Volatile
+    private var initialBatteryPercent: Double = 0.0
+
     // New: current active request id (only one active request supported at a time)
     @Volatile
     private var activeRequestId: String? = null
-
-    private val synthesisExecutor = Executors.newSingleThreadExecutor()
-
-    @Volatile
-    private var currentTask: Future<*>? = null
-
-    @Volatile
-    private var pendingText: String? = null
-    @Volatile
-    private var pendingSpeed: Float = 1.0f
-    @Volatile
-    private var pendingRequestId: String? = null
 
     companion object {
         private const val TAG = "PiperTTSManager"
     }
 
-    /**
-     * Initialize TTS. Pass a CoroutineScope if you want (not required).
-     */
-    fun initialize(scope: CoroutineScope?): Boolean {
+    fun initialize(scope: CoroutineScope): Boolean {
         return try {
             // Copy espeak-ng-data (and any other required files under the model dir) to external files directory
             copyDataDir("vits-piper-en_US-amy-low/espeak-ng-data")
@@ -185,11 +183,39 @@ class PiperTTSManager(private val context: Context) {
             .build()
 
         audioTrack = AudioTrack(
-            attr, format, if (bufLength > 0) bufLength else sampleRate,
-            AudioTrack.MODE_STREAM,
+            attr, format, bufLength, AudioTrack.MODE_STREAM,
             AudioManager.AUDIO_SESSION_ID_GENERATE
         )
         audioTrack?.play()
+    }
+
+    /**
+     * Get current CPU time in milliseconds for this process.
+     */
+    private fun getCpuTimeMs(): Long {
+        return Debug.threadCpuTimeNanos() / 1_000_000
+    }
+
+    /**
+     * Get current memory usage in MB for this process.
+     */
+    private fun getMemoryUsageMB(): Double {
+        val runtime = Runtime.getRuntime()
+        val usedMemory = runtime.totalMemory() - runtime.freeMemory()
+        return usedMemory / (1024.0 * 1024.0)
+    }
+
+    /**
+     * Get current battery percentage.
+     */
+    private fun getBatteryPercent(): Double {
+        return try {
+            val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER).toDouble()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get battery info: ${e.message}")
+            -1.0
+        }
     }
 
     /**
@@ -200,8 +226,6 @@ class PiperTTSManager(private val context: Context) {
         // record first-sample time if this is the first callback for the active request
         if (firstSampleRecorded.compareAndSet(false, true)) {
             firstSampleTimeNs = System.nanoTime()
-            // notify first sample to UI/adapter
-            firstSampleCallback?.invoke(activeRequestId)
         }
 
         // If the request was stopped or there is no active request, stop streaming
@@ -220,7 +244,7 @@ class PiperTTSManager(private val context: Context) {
     }
 
     /**
-     * Synthesize and speak text using Piper (VITS) model.
+     * Synthesize and speak text using Piper (VITS) model with energy tracking.
      * Accepts an optional requestId; if provided it will be used as the active request id.
      */
     fun synthesizeAndSpeak(text: String, speed: Float = 1.0f, requestId: String? = null) {
@@ -229,20 +253,15 @@ class PiperTTSManager(private val context: Context) {
             return
         }
 
-        if( currentTask !=null && !currentTask!!.isDone){
-
-            pendingText = text
-            pendingSpeed = speed
-            pendingRequestId = requestId
-
-            stopRequest(activeRequestId ?:return)
-
-            return
-        }
-
-        currentTask = synthesisExecutor.submit {
+        Thread {
             val startNs = System.nanoTime()
             val rid = requestId ?: "piper_${startNs}"
+
+            // Capture initial metrics
+            startCpuTimeMs = getCpuTimeMs()
+            initialMemoryMB = getMemoryUsageMB()
+            initialBatteryPercent = getBatteryPercent()
+
             synchronized(this) {
                 // Start this request as active (cancels previous implicitly by overriding activeRequestId)
                 activeRequestId = rid
@@ -266,24 +285,53 @@ class PiperTTSManager(private val context: Context) {
                 )
 
                 val endNs = System.nanoTime()
-                val firstMs =
-                    if (firstSampleTimeNs > 0) (firstSampleTimeNs - startNs) / 1_000_000 else -1L
+
+                // Calculate latency metrics
+                val firstMs = if (firstSampleTimeNs > 0) (firstSampleTimeNs - startNs) / 1_000_000 else -1L
                 val totalMs = (endNs - startNs) / 1_000_000
 
-                // Notify listener
+                // Calculate energy metrics
+                val endCpuTimeMs = getCpuTimeMs()
+                val endMemoryMB = getMemoryUsageMB()
+                val endBatteryPercent = getBatteryPercent()
+
+                val cpuTimeUsedMs = endCpuTimeMs - startCpuTimeMs
+                val memoryUsedMB = endMemoryMB - initialMemoryMB
+                val batteryDrainPercent = initialBatteryPercent - endBatteryPercent
+
+                val metrics = EnergyMetrics(
+                    cpuTimeMs = cpuTimeUsedMs,
+                    memoryMB = memoryUsedMB,
+                    estimatedBatteryPercent = batteryDrainPercent,
+                    firstLatencyMs = firstMs,
+                    totalLatencyMs = totalMs
+                )
+
+                // Notify listeners
                 latencyCallback?.invoke(firstMs, totalMs)
+                energyCallback?.invoke(metrics)
+
+                Log.i(TAG, "Metrics - CPU: ${cpuTimeUsedMs}ms, Memory: ${String.format("%.2f", memoryUsedMB)}MB, Battery: ${String.format("%.2f", batteryDrainPercent)}%, First: ${firstMs}ms, Total: ${totalMs}ms")
 
                 // Save to file for playback/sharing if generation produced samples
                 val filename = "${context.filesDir.absolutePath}/piper_generated.wav"
                 if (audio.samples.isNotEmpty()) {
-                    audio.save(filename)
-
+                    val ok = audio.save(filename)
+                    if (ok) Log.i(TAG, "Audio saved to $filename")
                 }
 
                 audioTrack?.stop()
             } catch (e: Exception) {
-                Log.e(TAG, "Error during synthesis:", e)
+                Log.e(TAG, "Error during synthesis: ${e.message}")
+                e.printStackTrace()
                 latencyCallback?.invoke(-1L, -1L)
+                energyCallback?.invoke(EnergyMetrics(
+                    cpuTimeMs = -1,
+                    memoryMB = -1.0,
+                    estimatedBatteryPercent = -1.0,
+                    firstLatencyMs = -1L,
+                    totalLatencyMs = -1L
+                ))
             } finally {
                 // Clear activeRequestId only if it still matches this rid
                 synchronized(this) {
@@ -291,26 +339,10 @@ class PiperTTSManager(private val context: Context) {
                         activeRequestId = null
                     }
                 }
-                currentTask = null
-                val nextText = pendingText
-                val nextSpeed = pendingSpeed
-                val nextRequestId =pendingRequestId
-
-                pendingText = null
-                pendingRequestId = null
-
-                if(nextText != null){
-
-                    synthesizeAndSpeak(
-                        text=nextText,
-                        speed=nextSpeed,
-                        requestId=nextRequestId
-                    )
-                }
-
             }
-        }
+        }.start()
     }
+
     /**
      * Request stop of a specific request id. If the id matches the active request we'll set isStopped
      * and clear the activeRequestId so the audio callback will stop streaming.
@@ -329,20 +361,6 @@ class PiperTTSManager(private val context: Context) {
                 Log.i(TAG, "Stopped Piper request: $requestId")
             } else {
                 Log.i(TAG, "stopRequest: requestId $requestId does not match activeRequestId $activeRequestId")
-            }
-        }
-    }
-
-    fun stopCurrent(){
-        synchronized(this){
-            isStopped=true
-            activeRequestId=null
-
-            try{
-                audioTrack?.pause()
-                audioTrack?.flush()
-            }catch(e:Exception){
-                Log.e(TAG, "Error stopping audio",e)
             }
         }
     }
@@ -371,3 +389,11 @@ class PiperTTSManager(private val context: Context) {
         }
     }
 }
+
+
+
+
+
+
+
+
